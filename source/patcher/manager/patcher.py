@@ -1,0 +1,454 @@
+import os
+import re
+import sys
+import errno
+import mmap
+import shutil
+import contextlib
+import filecmp
+from packaging.version import Version
+from enum import Enum
+
+from patcher.constants import COLOR_CYAN, MIN_ANTIGRAVITY_VERSION
+from patcher.utils.console import (
+    color,
+    info,
+    hint,
+    ok,
+    warn,
+    err,
+    step,
+    print_panel,
+)
+from patcher.utils.file import (
+    file_hash,
+    file_size,
+    format_bytes,
+    fix_posix_permissions,
+    resign_macos_bundle,
+    resign_macos_binary,
+    ensure_macos_writable,
+)
+from patcher.utils.update import handle_patch_failure
+from patcher.utils.admin import terminate_processes
+from patcher.utils.atomic import atomic_replace_posix, apply_patches_to_data
+
+BAK_EXT = ".agybak"
+
+
+class VersionStatus(Enum):
+    OK = "ok"
+    TOO_OLD = "too_old"
+    NOT_FOUND = "not_found"
+    PARSE_ERROR = "parse_error"
+
+
+class Gate:
+    def __init__(self, sig, patched, fix, offset=0, desc=""):
+        self.sig = re.compile(sig, re.S)
+        self.patched = re.compile(patched, re.S)
+        self.fix = fix
+        self.offset = offset
+        self.desc = desc
+
+    def find(self, data):
+        m = self.patched.search(data)
+        if m:
+            return ("patched", m.start() + self.offset)
+        m = self.sig.search(data)
+        if not m:
+            raise LookupError("gate signature not found (unsupported version?)")
+        if self.sig.search(data, m.end()):
+            raise LookupError("gate signature is not unique — refusing to guess")
+        return ("unpatched", m.start() + self.offset)
+
+    def resolve(self, data):
+        """(kind, write-offset, concrete-gate). The concrete gate carries the fix bytes
+        and label to apply — so a MultiGate can hand back the arch-matching sub-gate."""
+        kind, off = self.find(data)
+        return kind, off, self
+
+
+class MultiGate:
+    """One logical gate whose machine code differs per CPU arch (the Manager's auth check
+    compiles to distinct amd64 vs arm64 instructions), so it declares one Gate signature
+    per arch. A given binary matches exactly one — different archs share no byte pattern —
+    so there's no ambiguity; the first that finds a match wins."""
+
+    def __init__(self, *gates, desc=""):
+        self.gates = gates
+        self.desc = desc
+
+    def resolve(self, data):
+        err = None
+        for g in self.gates:
+            try:
+                return g.resolve(data)
+            except LookupError as e:
+                err = e
+        raise err or LookupError("no gate signature matched")
+
+
+# language_server.exe / language_server (Go binary) auth validator gate:
+# cmp byte[rax+8],0 ; je short  ->  mov byte[rax+8],1 ; nop*2 (x64)
+# ldrb w3,[x0,#8] ; tbz w3,#0,skip  ->  mov w3,#1 ; strb w3,[x0,#8] (arm64)
+# (hasValidAuth=true)
+# (wildcarded/re.S displacements)
+MANAGER_GATE_X64 = Gate(
+    rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
+    rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60",
+    b"\xc6\x40\x08\x01\x90\x90",
+    offset=0,
+    desc="hasValidAuth=true (x64)",
+)
+
+# arm64: force hasValidAuth and remove the token-attachment branch.
+#   ldrb w3,[x0,#8] ; tbz w3,#0,skip  ->  mov w3,#1 ; strb w3,[x0,#8]
+# The branch displacement spans the low byte, so accept every encoding that keeps
+# Rt=w3. Builds use either one or two setup instructions before the token stp.
+_ARM64_TBZ_W3_BIT0 = rb"[\x03\x23\x43\x63\x83\xa3\xc3\xe3]..\x36"
+_ARM64_TOKEN_SETUP = rb"(?:....){1,2}\x03\x10\x06\xa9"
+MANAGER_GATE_ARM64 = Gate(
+    rb"\x03\x20\x40\x39" + _ARM64_TBZ_W3_BIT0 + _ARM64_TOKEN_SETUP,
+    rb"\x23\x00\x80\x52\x03\x20\x00\x39" + _ARM64_TOKEN_SETUP,
+    b"\x23\x00\x80\x52\x03\x20\x00\x39",
+    offset=0,
+    desc="hasValidAuth=true (arm64)",
+)
+
+MANAGER_GATE = MultiGate(MANAGER_GATE_X64, MANAGER_GATE_ARM64, desc="hasValidAuth=true")
+
+
+from patcher.manager.discovery import find_asar_relative_to_manager, read_package_json_from_asar
+
+def check_antigravity_version(asar_path):
+    ver_str = read_package_json_from_asar(asar_path)
+    if ver_str is None:
+        return VersionStatus.NOT_FOUND, None
+
+    try:
+        detected = Version(ver_str)
+        minimum = Version(MIN_ANTIGRAVITY_VERSION)
+        status = VersionStatus.OK if detected >= minimum else VersionStatus.TOO_OLD
+        return status, ver_str
+    except Exception:
+        return VersionStatus.PARSE_ERROR, ver_str
+
+
+@contextlib.contextmanager
+def _scan_data(f):
+    # Reading a modified signed Mach-O through mmap can cause an uncatchable
+    # CODESIGNING SIGKILL on macOS, including during post-write verification.
+    if sys.platform == "darwin":
+        f.seek(0)
+        yield f.read()
+        return
+    if os.fstat(f.fileno()).st_size == 0:
+        yield b""
+        return
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    try:
+        yield mm
+    finally:
+        mm.close()
+
+
+@contextlib.contextmanager
+def _mapped(path):
+    """Read-only bytes-view для сканирования сигнатур.
+
+    На macOS не маппит страницы подписанного файла (SIGKILL-риск),
+    а читает через _scan_data; на остальных ОС — zero-copy mmap."""
+    with open(path, "rb") as f:
+        with _scan_data(f) as data:
+            yield data
+
+
+def is_locked(path):
+    """
+    True, если файл занят (приложение запущено).
+
+    На POSIX замена файла через os.replace возможна даже при работающем процессе,
+    поэтому блокирующим считаем только Windows.
+
+    Примечание: на POSIX это не гарантирует, что файл не используется.
+    Если нужна проверка на занятость, требуется более сложная логика
+    (например, проверка процессов или файловые блокировки).
+    """
+    if os.name != "nt":
+        return False
+
+    try:
+        with open(path, "r+b"):
+            return False
+    except OSError:
+        return True
+
+
+def get_status(path):
+    if not path or not os.path.isfile(path):
+        return ("unknown", None)
+    try:
+        with _mapped(path) as d:
+            try:
+                state, off, g = MANAGER_GATE.resolve(d)
+                return (state, g)
+            except LookupError:
+                return ("unknown", None)
+    except OSError:
+        return ("unknown", None)
+
+
+def is_already_patched(path):
+    return get_status(path)[0] == "patched"
+
+
+def _make_backup(path):
+    bak = path + BAK_EXT
+    if os.path.exists(bak):
+        if filecmp.cmp(path, bak, shallow=False):
+            return
+        info(f"Backup is stale (app updated) — refreshing {os.path.basename(path)}{BAK_EXT}")
+    else:
+        info(f"Creating backup -> {os.path.basename(path)}{BAK_EXT}")
+    if sys.platform == "darwin":
+        # Файлы внутри .app часто несут uchg-флаг: даже root получает
+        # Errno 1 Operation not permitted при copy2 без предварительного chflags.
+        ensure_macos_writable(path)
+    try:
+        shutil.copy2(path, bak)
+    except (PermissionError, OSError) as e:
+        # EPERM (errno 1) на macOS — почти всегда immutable-флаг/владелец.
+        # Одна повторная попытка после снятия флагов, затем проброс наружу,
+        # где do_patch_manager покажет понятную подсказку вместо traceback.
+        need_retry = (
+            sys.platform == "darwin"
+            and isinstance(e, OSError)
+            and e.errno in (errno.EPERM, errno.EACCES)
+        )
+        if need_retry:
+            warn("Backup blocked by macOS flags, retrying after removing flags...")
+            ensure_macos_writable(path)
+            shutil.copy2(path, bak)
+        else:
+            raise
+    fix_posix_permissions(bak)
+    ok(f"Backup: {os.path.basename(bak)} ({format_bytes(file_size(bak))})")
+
+
+def do_patch_manager(path):
+    from patcher.cli import confirmed
+    from patcher.utils.captcha import confirm_with_captcha
+
+    if not path or not os.path.isfile(path):
+        from patcher.cli import offer_download_and_block
+        offer_download_and_block("Antigravity 2.0")
+        return
+
+    hash_before = file_hash(path)
+    info(f"Target: {color(path, COLOR_CYAN)}")
+    hint(f"Size: {color(format_bytes(file_size(path)), COLOR_CYAN)}")
+
+    # Проверка версии Antigravity (считывается из package.json в app.asar)
+    asar_path = find_asar_relative_to_manager(path)
+    if asar_path:
+        ver_status, ver_str = check_antigravity_version(asar_path)
+        if ver_status == VersionStatus.TOO_OLD:
+            err(f"Unsupported version: {ver_str}")
+            err(f"Minimum required: {MIN_ANTIGRAVITY_VERSION}")
+            hint("Please update Antigravity and try again.")
+            if not confirmed("Proceed anyway?"):
+                return
+        elif ver_status == VersionStatus.NOT_FOUND:
+            warn("Could not detect Antigravity version (package.json not found in ASAR).")
+            if not confirmed("Proceed without version check?"):
+                return
+        elif ver_status == VersionStatus.PARSE_ERROR:
+            warn(f"Could not parse version string: {ver_str}")
+            if not confirmed("Proceed anyway?"):
+                return
+    print()
+
+    write_success = False
+    off = 0
+    for attempt in range(2):
+        if is_locked(path):
+            if attempt == 0:
+                warn("Binary is locked (Antigravity Manager is running).")
+                if confirmed("Would you like to automatically close running Antigravity processes and retry?"):
+                    terminate_processes(["Antigravity", "Antigravity IDE", "antigravity", "antigravity-ide", "language_server"])
+                    import time
+                    time.sleep(1.5)
+                    continue
+            err("File is locked — close the app first.")
+            return
+
+        matched_gate = None
+        try:
+            with _mapped(path) as d:
+                try:
+                    kind, off, matched_gate = MANAGER_GATE.resolve(d)
+                except LookupError as e:
+                    err(f"{e}")
+                    handle_patch_failure()
+                    return
+                if kind == "patched":
+                    hint("Antigravity Manager already patched.")
+                    if not confirm_with_captcha("Apply patch anyway?"):
+                        return
+        except OSError as e:
+            err(f"Read error: {e}")
+            return
+
+        try:
+            _make_backup(path)
+        except (PermissionError, OSError) as e:
+            err(f"Backup error: {e}")
+            if sys.platform == "darwin":
+                hint("macOS blocked writing inside Antigravity.app (Errno 1 Operation not permitted).")
+                hint("Close Antigravity, then re-run the patcher with sudo:")
+                hint("  sudo python main.py   (or sudo ./Open_AG_Patcher)")
+                hint("If it still fails: ls -lO shows 'uchg' flag -> patcher already tried 'chflags nouchg'.")
+            else:
+                hint("No write access — re-run as admin/root and close Antigravity first.")
+            handle_patch_failure()
+            return
+
+        try:
+            if os.name == "nt":
+                # Windows: прямая запись с проверкой блокировки
+                with open(path, "r+b") as f:
+                    bdata = bytearray(f.read())
+
+                    # Валидация (offset, границы, размер) и применение патча
+                    bdata = apply_patches_to_data(bdata, [(off, matched_gate)])
+
+                    f.seek(0)
+                    f.write(bdata)
+                    f.flush()
+                    os.fsync(f.fileno())
+            else:
+                # POSIX: атомарная замена через временный файл
+                with open(path, "rb") as f:
+                    bdata = bytearray(f.read())
+
+                # Валидация (offset, границы, размер) и применение патча
+                bdata = apply_patches_to_data(bdata, [(off, matched_gate)])
+
+                # Атомарная замена с безопасным временным файлом
+                # (на macOS каталог .app может нести uchg — снимаем перед mkstemp)
+                if sys.platform == "darwin":
+                    ensure_macos_writable(path)
+                atomic_replace_posix(path, bytes(bdata))
+
+            write_success = True
+            break
+        except PermissionError as e:
+            if attempt == 0:
+                if sys.platform == "darwin":
+                    warn(f"Write blocked by macOS (flags/owner): {e}")
+                    ensure_macos_writable(path)
+                    import time
+                    time.sleep(0.5)
+                    continue
+                warn(f"Permission denied (file locked): {e}")
+                if confirmed("Would you like to automatically close running processes and retry?"):
+                    terminate_processes(["Antigravity", "Antigravity IDE", "antigravity", "antigravity-ide", "language_server"])
+                    import time
+                    time.sleep(1.5)
+                    continue
+            err(f"Write error (Permission denied): {e}")
+            if sys.platform == "darwin":
+                hint("Close Antigravity and re-run with sudo: sudo python main.py")
+            handle_patch_failure()
+            return
+        except OSError as e:
+            # EPERM вне PermissionError (на всякий случай) — та же подсказка про sudo/флаги
+            if e.errno in (errno.EPERM, errno.EACCES) and attempt == 0 and sys.platform == "darwin":
+                warn(f"Write blocked by macOS (flags/owner): {e}")
+                ensure_macos_writable(path)
+                import time
+                time.sleep(0.5)
+                continue
+            err(f"Write error: {e}")
+            handle_patch_failure()
+            return
+        except Exception as e:
+            err(f"Write error: {e}")
+            handle_patch_failure()
+            return
+
+    if not write_success:
+        handle_patch_failure()
+        return
+
+    hash_after = file_hash(path)
+    resign_macos_bundle(path)
+    resign_macos_binary(path)
+    print()
+    step("Patch manager binary", True, matched_gate.desc)
+    print()
+    panel_rows = [
+        ("Target", os.path.basename(path)),
+        ("Gate", f"{matched_gate.desc} @ 0x{off:x}"),
+    ]
+    if hash_before and hash_after:
+        panel_rows.append(("Before", f"{hash_before[:8]}...{hash_before[56:]}"))
+        panel_rows.append(("After", f"{hash_after[:8]}...{hash_after[56:]}"))
+    print_panel("PATCH COMPLETE", panel_rows)
+    hint("Restart Antigravity/Antigravity IDE for the changes to take effect.")
+
+
+def do_restore_manager(path):
+    from patcher.cli import confirmed
+
+    if not os.path.isfile(path):
+        err(f"Target is not a file: {path}")
+        return
+
+    bak = path + BAK_EXT
+    if not os.path.exists(bak):
+        warn(f"No backup for {os.path.basename(path)} (nothing to restore).")
+        return
+
+    status, _ = get_status(path)
+    if status != "patched":
+        warn("Manager is not patched — skipping restore (backup may be a different build).")
+        if not confirmed("Restore from backup anyway?"):
+            hint("Restore cancelled.")
+            return
+
+    if is_locked(path):
+        err("Binary is locked — close the app first.")
+        return
+
+    if not confirmed("Restore Manager from backup?"):
+        hint("Restore cancelled.")
+        return
+
+    hash_before = file_hash(path)
+    try:
+        if os.name == "nt":
+            shutil.copy2(bak, path)
+        else:
+            # Читаем бэкап в память
+            with open(bak, "rb") as f:
+                bak_data = f.read()
+
+            # Атомарная замена с метаданными из бэкапа
+            atomic_replace_posix(path, bak_data, meta_source=bak)
+
+        fix_posix_permissions(path)
+    except Exception as e:
+        err(f"Restore error: {e}")
+        return
+
+    hash_after = file_hash(path)
+    resign_macos_bundle(path)
+    resign_macos_binary(path)
+    print()
+    panel_rows = [("Target", os.path.basename(path))]
+    if hash_before and hash_after and hash_before != hash_after:
+        panel_rows.append(("Before", f"{hash_before[:8]}...{hash_before[56:]}"))
+        panel_rows.append(("After", f"{hash_after[:8]}...{hash_after[56:]}"))
+    print_panel("RESTORE COMPLETE", panel_rows)
