@@ -3,6 +3,7 @@ import sys
 import urllib.request
 import urllib.error
 import webbrowser
+from urllib.parse import urlparse
 
 from patcher.constants import VERSION, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_BOLD, COLOR_UNDERLINE
 from patcher.utils.console import color, link, info, ok, warn, err, hint, _frame_border, _frame_row
@@ -24,6 +25,31 @@ def get_last_update_result():
 def set_last_update_result(result):
     global LAST_UPDATE_RESULT
     LAST_UPDATE_RESULT = result
+
+
+def _is_trusted_url(url):
+    """True только для https-ссылок github.com (без подмены хоста/схемы)."""
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        return False
+    return parsed.scheme == "https" and parsed.netloc.lower() in ("github.com", "www.github.com")
+
+
+def _open_trusted_url(url, fallback=RELEASES_URL):
+    """Открывает ссылку в браузере, только если это https-адрес GitHub.
+
+    html_url приходит из ответа GitHub API: без проверки скомпрометированный
+    ответ открыл бы в браузере произвольный адрес (file:, javascript: и т.п.).
+    """
+    if url and _is_trusted_url(url):
+        target = url
+    else:
+        if url:
+            warn(f"Untrusted release URL ignored: {url}")
+        target = fallback
+    webbrowser.open(target)
+    return target
 
 
 def print_network_error_warning():
@@ -149,8 +175,8 @@ def handle_patch_failure():
         info(f"An update for Open Antigravity Patcher is available: {color(tag, COLOR_GREEN, COLOR_BOLD)} (current: {color(VERSION, COLOR_YELLOW)})")
         hint(f"Download: {color(url, COLOR_CYAN)}")
         if confirmed("A patcher update is available. Would you like to open the releases page to install it?"):
-            webbrowser.open(url or RELEASES_URL)
-            ok(f"Opening: {color(url or RELEASES_URL, COLOR_CYAN)}")
+            opened = _open_trusted_url(url)
+            ok(f"Opening: {color(opened, COLOR_CYAN)}")
     else:
         if LAST_UPDATE_RESULT == "up_to_date":
             ok(f"You are using the latest version of Open Antigravity Patcher (v{VERSION}).")

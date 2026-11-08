@@ -14,6 +14,11 @@ from patcher.utils.console import (
     step,
     print_panel,
 )
+from patcher.utils.atomic import (
+    atomic_replace_posix,
+    atomic_replace_windows,
+    atomic_write_text,
+)
 from patcher.utils.file import (
     file_hash,
     file_size,
@@ -127,8 +132,9 @@ def do_patch_vscode(extension_js_path):
     hint(f"Size: {color(format_bytes(file_size(path)), COLOR_CYAN)}")
     print()
 
+    # newline="" — сохраняем исходные переводы строк (на Windows CRLF)
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8", newline="") as f:
             content = f.read()
     except Exception as e:
         err(f"Read error: {e}")
@@ -154,7 +160,7 @@ def do_patch_vscode(extension_js_path):
         bak = path + BAK_EXT
         if os.path.isfile(bak):
             try:
-                with open(bak, "r", encoding="utf-8") as f:
+                with open(bak, "r", encoding="utf-8", newline="") as f:
                     new_content = f.read()
             except Exception as e:
                 warn(f"Could not read backup for re-patch: {e}")
@@ -171,8 +177,8 @@ def do_patch_vscode(extension_js_path):
             handle_patch_failure()
             return False
         try:
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write(new_content)
+            # Атомарная запись: обрыв не оставит обрезанный extension.js.
+            atomic_write_text(path, new_content)
         except PermissionError as e:
             err(f"Write error (file locked?): {e}")
             hint("Close VS Code windows and retry.")
@@ -223,7 +229,7 @@ def do_restore_vscode(extension_js_path):
         return
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8", newline="") as f:
             content = f.read()
     except Exception as e:
         err(f"Read error: {e}")
@@ -241,7 +247,13 @@ def do_restore_vscode(extension_js_path):
 
     hash_before = file_hash(path)
     try:
-        shutil.copy2(bak, path)
+        # Атомарное восстановление: bak уже прочитан, пишем байт-в-байт.
+        with open(bak, "rb") as f:
+            bak_bytes = f.read()
+        if os.name == "nt":
+            atomic_replace_windows(path, bak_bytes, meta_source=bak)
+        else:
+            atomic_replace_posix(path, bak_bytes, meta_source=bak)
         fix_posix_permissions(path)
     except PermissionError as e:
         err(f"Restore error (file locked?): {e}")

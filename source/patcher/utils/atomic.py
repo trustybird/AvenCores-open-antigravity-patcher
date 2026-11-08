@@ -1,4 +1,5 @@
 import os
+import shutil
 import stat
 import tempfile
 
@@ -81,6 +82,80 @@ def atomic_replace_posix(path, data, meta_source=None):
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+def atomic_replace_windows(path, data, meta_source=None):
+    """Атомарная замена файла на Windows через временный файл и os.replace.
+
+    Windows-ветки патчеров раньше писали файл напрямую (open("w") / "r+b"):
+    обрыв питания или падение посреди записи оставлял обрезанный файл.
+    os.replace в пределах одного каталога атомарен и на Windows. Права и
+    timestamps переносятся отдельно — os.replace их не сохраняет.
+    """
+    path = os.path.abspath(path)
+
+    # Запрещаем работу с символическими ссылками
+    if os.path.islink(path):
+        raise ValueError("Refusing to patch symlink")
+
+    if not os.path.isfile(path):
+        raise ValueError("Target is not a regular file")
+
+    if meta_source is None:
+        meta_source = path
+
+    directory = os.path.dirname(path)
+
+    # Безопасное создание временного файла с O_EXCL
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+        dir=directory,
+    )
+
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Переносим атрибуты оригинала: os.replace их не копирует.
+        try:
+            shutil.copystat(meta_source, tmp_path)
+        except OSError:
+            pass
+
+        # Атомарная замена
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def atomic_write_text(path, text, encoding="utf-8"):
+    """Атомарная запись текстового файла без преобразования переводов строк.
+
+    Читать исходный файл нужно с newline="" — иначе на Windows CRLF
+    нормализуется в LF и перезапись изменит весь файл, а не патч.
+    """
+    data = text.encode(encoding)
+
+    # Portable-установки иногда держат main.js/extension.js символической
+    # ссылкой: атомарная замена подменила бы её обычным файлом, поэтому
+    # пишем напрямую (как раньше).
+    if os.path.islink(path):
+        with open(path, "w", encoding=encoding, newline="") as f:
+            f.write(text)
+        return
+
+    if os.name == "nt":
+        atomic_replace_windows(path, data)
+    else:
+        atomic_replace_posix(path, data)
 
 
 def validate_patch_params(bdata, patches):
