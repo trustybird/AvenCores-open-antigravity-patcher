@@ -28,10 +28,15 @@ from patcher.utils.file import (
     resign_macos_bundle,
     resign_macos_binary,
     ensure_macos_writable,
+    rotate_backup,
 )
 from patcher.utils.update import handle_patch_failure
 from patcher.utils.admin import terminate_processes
-from patcher.utils.atomic import atomic_replace_posix, apply_patches_to_data
+from patcher.utils.atomic import (
+    atomic_replace_posix,
+    atomic_replace_windows,
+    apply_patches_to_data,
+)
 
 BAK_EXT = ".agybak"
 
@@ -203,12 +208,26 @@ def is_already_patched(path):
     return get_status(path)[0] == "patched"
 
 
-def _make_backup(path):
+def _make_backup(path, patched=False):
+    """Снимок чистого файла как <path>.agybak.
+
+    patched=True  — файл уже пропатчен (повторный патч после CAPTCHA):
+    существующий бэкап НЕ перезаписывается, иначе pristine-оригинал
+    теряется и RESTORE восстанавливает уже пропатченный бинарь.
+
+    Бэкап, не совпадающий с чистым файлом, устарел (приложение
+    автообновилось): старый снимок сохраняем рядом как <bak>.<timestamp>."""
     bak = path + BAK_EXT
     if os.path.exists(bak):
         if filecmp.cmp(path, bak, shallow=False):
             return
-        info(f"Backup is stale (app updated) — refreshing {os.path.basename(path)}{BAK_EXT}")
+        if patched:
+            warn(f"Backup differs from the patched file — keeping it as the pristine copy: "
+                 f"{os.path.basename(bak)}")
+            return
+        rotated = rotate_backup(bak)
+        if rotated:
+            info(f"Stale backup kept as {os.path.basename(rotated)}")
     else:
         info(f"Creating backup -> {os.path.basename(path)}{BAK_EXT}")
     if sys.platform == "darwin":
@@ -301,7 +320,7 @@ def do_patch_manager(path):
             return
 
         try:
-            _make_backup(path)
+            _make_backup(path, patched=(kind == "patched"))
         except (PermissionError, OSError) as e:
             err(f"Backup error: {e}")
             if sys.platform == "darwin":
@@ -316,17 +335,15 @@ def do_patch_manager(path):
 
         try:
             if os.name == "nt":
-                # Windows: прямая запись с проверкой блокировки
-                with open(path, "r+b") as f:
+                # Windows: атомарная замена — обрыв записи не оставит
+                # обрезанный language_server.
+                with open(path, "rb") as f:
                     bdata = bytearray(f.read())
 
-                    # Валидация (offset, границы, размер) и применение патча
-                    bdata = apply_patches_to_data(bdata, [(off, matched_gate)])
+                # Валидация (offset, границы, размер) и применение патча
+                bdata = apply_patches_to_data(bdata, [(off, matched_gate)])
 
-                    f.seek(0)
-                    f.write(bdata)
-                    f.flush()
-                    os.fsync(f.fileno())
+                atomic_replace_windows(path, bytes(bdata))
             else:
                 # POSIX: атомарная замена через временный файл
                 with open(path, "rb") as f:
@@ -428,13 +445,13 @@ def do_restore_manager(path):
 
     hash_before = file_hash(path)
     try:
-        if os.name == "nt":
-            shutil.copy2(bak, path)
-        else:
-            # Читаем бэкап в память
-            with open(bak, "rb") as f:
-                bak_data = f.read()
+        # Читаем бэкап в память: запись должна быть атомарной на обеих ОС.
+        with open(bak, "rb") as f:
+            bak_data = f.read()
 
+        if os.name == "nt":
+            atomic_replace_windows(path, bak_data, meta_source=bak)
+        else:
             # Атомарная замена с метаданными из бэкапа
             atomic_replace_posix(path, bak_data, meta_source=bak)
 

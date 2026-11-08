@@ -18,6 +18,7 @@ from patcher.utils.console import (
 )
 from patcher.utils.update import handle_patch_failure
 from patcher.utils.admin import terminate_processes
+from patcher.utils.atomic import atomic_write_text
 from patcher.utils.file import (
     file_hash,
     file_size,
@@ -150,8 +151,9 @@ def do_patch(main_js_path, show_search_line=False):
             return
     # VersionStatus.OK — продолжаем без вопросов
 
+    # newline="" — читаем/пишем байт-в-байт (на Windows не превращаем CRLF в LF)
     try:
-        with open(main_js_path, "r", encoding="utf-8") as f:
+        with open(main_js_path, "r", encoding="utf-8", newline="") as f:
             content = f.read()
     except Exception as e:
         err(f"Read error: {e}")
@@ -231,8 +233,8 @@ def do_patch(main_js_path, show_search_line=False):
     write_success = False
     for attempt in range(2):
         try:
-            with open(main_js_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
+            # Атомарная запись: обрыв не оставит обрезанный main.js.
+            atomic_write_text(main_js_path, new_content)
             fix_posix_permissions(main_js_path)
             write_success = True
             break

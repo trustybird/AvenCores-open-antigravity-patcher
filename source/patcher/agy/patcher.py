@@ -26,10 +26,15 @@ from patcher.utils.file import (
     resign_macos_bundle,
     resign_macos_binary,
     ensure_macos_writable,
+    rotate_backup,
 )
 from patcher.utils.update import handle_patch_failure
 from patcher.utils.admin import terminate_processes
-from patcher.utils.atomic import atomic_replace_posix, apply_patches_to_data
+from patcher.utils.atomic import (
+    atomic_replace_posix,
+    atomic_replace_windows,
+    apply_patches_to_data,
+)
 
 BAK_EXT = ".agybak"
 
@@ -254,16 +259,27 @@ def is_already_patched(path):
     return get_status(path)[0] == "patched"
 
 
-def _make_backup(path):
+def _make_backup(path, patched=False):
     """Снимок чистого файла как <path>.agybak.
-    Вызывается только когда файл unpatched — живые байты это pristine-оригинал.
-    Бэкап, не совпадающий с файлом, устарел (приложение автообновилось) —
-    обновляем его, а не храним."""
+
+    patched=False — файл чистый, живые байты это pristine-оригинал.
+    patched=True  — файл уже пропатчен (повторный патч после CAPTCHA):
+    существующий бэкап НЕ перезаписывается, иначе pristine-оригинал
+    теряется и RESTORE восстанавливает уже пропатченный бинарь.
+
+    Бэкап, не совпадающий с чистым файлом, устарел (приложение
+    автообновилось): старый снимок сохраняем рядом как <bak>.<timestamp>."""
     bak = path + BAK_EXT
     if os.path.exists(bak):
         if filecmp.cmp(path, bak, shallow=False):
             return  # бэкап уже соответствует этому билду
-        info(f"Backup is stale (app updated) — refreshing {os.path.basename(path)}{BAK_EXT}")
+        if patched:
+            warn(f"Backup differs from the patched file — keeping it as the pristine copy: "
+                 f"{os.path.basename(bak)}")
+            return
+        rotated = rotate_backup(bak)
+        if rotated:
+            info(f"Stale backup kept as {os.path.basename(rotated)}")
     else:
         info(f"Creating backup -> {os.path.basename(path)}{BAK_EXT}")
     if sys.platform == "darwin":
@@ -287,20 +303,44 @@ def _make_backup(path):
 
 
 def _copy_to_user_bin(path):
+    """Кладёт рабочую копию бинаря в ~/.local/bin/agy (POSIX).
+
+    Запись идёт вне каталога Antigravity, поэтому:
+      * спрашиваем подтверждение (и не трогаем каталог без него);
+      * существующий файл не удаляем, а сохраняем как agy.prev.
+    """
+    from patcher.cli import confirmed
     from patcher.utils.file import get_posix_invoking_user_home
     user_home = get_posix_invoking_user_home()
     dest_dir = os.path.join(user_home, ".local", "bin") if user_home else os.path.expanduser("~/.local/bin")
     dest_path = os.path.join(dest_dir, "agy")
     if os.path.abspath(path) == os.path.abspath(dest_path):
         return
+
+    replace_existing = False
+    if os.path.exists(dest_path):
+        try:
+            # clear_cache: copy2 сохраняет mtime, и filecmp может вернуть
+            # закешированный результат для пары с «теми же» сигнатурами.
+            filecmp.clear_cache()
+            if filecmp.cmp(path, dest_path, shallow=False):
+                return  # копия уже совпадает с целевым файлом
+        except OSError:
+            pass
+        if not confirmed(f"{dest_path} already exists. Replace it (the current copy is kept as .prev)?"):
+            hint(f"Skipped copying to {dest_path}")
+            return
+        replace_existing = True
+
     info(f"Storing file in user system folder -> {dest_path}")
     try:
         os.makedirs(dest_dir, exist_ok=True)
-        if os.path.exists(dest_path):
+        if replace_existing:
             try:
-                os.remove(dest_path)
-            except Exception:
-                pass
+                shutil.move(dest_path, dest_path + ".prev")
+                info(f"Previous copy kept as: {dest_path}.prev")
+            except Exception as e:
+                warn(f"Could not preserve previous copy: {e}")
         shutil.copy2(path, dest_path)
         os.chmod(dest_path, 0o755)
         ok(f"File successfully copied to: {dest_path}")
@@ -324,6 +364,7 @@ def do_patch_agy(path):
 
     write_success = False
     patches = []  # [(offset, gate), ...] — гейты, требующие записи
+    file_was_patched = False  # файл уже частично/полностью пропатчен
     for attempt in range(2):
         if is_locked(path):
             if attempt == 0:
@@ -349,10 +390,13 @@ def do_patch_agy(path):
                         handle_patch_failure()
                         return
                     for kind, offsets, g in matches:
+                        if kind == "patched":
+                            file_was_patched = True
                         if kind == "unpatched":
                             all_patched = False
                             for off in offsets:
                                 patches.append((off, g))
+                file_was_patched = file_was_patched or all_patched
                 if all_patched:
                     hint("agy already patched (all gates).")
                     if not confirm_with_captcha("Apply patch anyway?"):
@@ -371,7 +415,7 @@ def do_patch_agy(path):
             return
 
         try:
-            _make_backup(path)
+            _make_backup(path, patched=file_was_patched)
         except (PermissionError, OSError) as e:
             err(f"Backup error: {e}")
             if sys.platform == "darwin":
@@ -385,14 +429,12 @@ def do_patch_agy(path):
 
         try:
             if os.name == "nt":
-                # Windows: прямая запись с проверкой блокировки
-                with open(path, "r+b") as f:
+                # Windows: атомарная замена — обрыв записи не оставит
+                # обрезанный бинарь (прямая запись "r+b" была неатомарной).
+                with open(path, "rb") as f:
                     bdata = bytearray(f.read())
-                    bdata = apply_patches_to_data(bdata, patches)
-                    f.seek(0)
-                    f.write(bdata)
-                    f.flush()
-                    os.fsync(f.fileno())
+                bdata = apply_patches_to_data(bdata, patches)
+                atomic_replace_windows(path, bytes(bdata))
             else:
                 # POSIX: атомарная замена через временный файл
                 with open(path, "rb") as f:
@@ -494,13 +536,13 @@ def do_restore_agy(path):
 
     hash_before = file_hash(path)
     try:
-        if os.name == "nt":
-            shutil.copy2(bak, path)
-        else:
-            # Читаем бэкап в память
-            with open(bak, "rb") as f:
-                bak_data = f.read()
+        # Читаем бэкап в память: запись должна быть атомарной на обеих ОС.
+        with open(bak, "rb") as f:
+            bak_data = f.read()
 
+        if os.name == "nt":
+            atomic_replace_windows(path, bak_data, meta_source=bak)
+        else:
             # Атомарная замена с метаданными из бэкапа
             atomic_replace_posix(path, bak_data, meta_source=bak)
 

@@ -49,8 +49,11 @@ def terminate_processes(names):
                 if res.returncode == 0:
                     success = True
             else:
+                # -x (точное имя процесса): без -f, чтобы не убить посторонний
+                # процесс, в командной строке которого встречается подстрока
+                # ("agy", "language_server", ...).
                 res = subprocess.run(
-                    ["pkill", "-f", name],
+                    ["pkill", "-x", name],
                     capture_output=True, text=True, timeout=10
                 )
                 if res.returncode == 0:

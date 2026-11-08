@@ -95,6 +95,32 @@ def backup_json_file(path):
     return backup_path
 
 
+def rotate_backup(path):
+    """Переименовывает бэкап в уникальное имя <path>.<YYYYmmdd-HHMMSS>.
+
+    Нужно, чтобы не затереть единственный pristine-снимок: при автообновлении
+    приложения старый бэкап сохраняется рядом, а не перезаписывается.
+    Возвращает новый путь или "" при неудаче.
+    """
+    if not os.path.exists(path):
+        return ""
+
+    base = f"{path}.{time.strftime('%Y%m%d-%H%M%S')}"
+    new_path = base
+    counter = 1
+    while os.path.exists(new_path):
+        counter += 1
+        new_path = f"{base}-{counter}"
+
+    try:
+        shutil.move(path, new_path)
+    except OSError:
+        return ""
+
+    fix_posix_permissions(new_path)
+    return new_path
+
+
 def find_app_bundle(path):
     """Поднимается вверх от path до первой директории, оканчивающейся на .app.
 
