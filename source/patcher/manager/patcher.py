@@ -118,6 +118,14 @@ MANAGER_GATE_ARM64 = Gate(
 
 MANAGER_GATE = MultiGate(MANAGER_GATE_X64, MANAGER_GATE_ARM64, desc="hasValidAuth=true")
 
+# 2.35.1 added a second, client-side gate: the language server matches the
+# protobuf field name "ineligible" in the server response and stops.  Renaming
+# it to the same-length "inexigible" makes the client ignore that refusal.
+# This is the same 10-byte rename used by the community ag-unblock/agfix tools.
+MANAGER_CLIENT_GATE_OLD = b"ineligible"
+MANAGER_CLIENT_GATE_NEW = b"inexigible"
+MANAGER_CLIENT_GATE_DESC = "ineligible->inexigible"
+
 
 from patcher.manager.discovery import find_asar_relative_to_manager, read_package_json_from_asar
 
@@ -185,6 +193,42 @@ def is_locked(path):
         return True
 
 
+def _count_sub(data, needle):
+    """Count non-overlapping occurrences in bytes-like/mmap data."""
+    count = 0
+    start = 0
+    while True:
+        idx = data.find(needle, start)
+        if idx < 0:
+            return count
+        count += 1
+        start = idx + len(needle)
+
+
+def _client_gate_state(data):
+    old = _count_sub(data, MANAGER_CLIENT_GATE_OLD)
+    new = _count_sub(data, MANAGER_CLIENT_GATE_NEW)
+    if old == 0 and new == 0:
+        return "not_applicable"
+    if old == 0:
+        return "patched"
+    if new == 0:
+        return "unpatched"
+    return "partial"
+
+
+def _apply_client_gate(data):
+    """Apply the equal-length ineligible -> inexigible rename.
+
+    Returns (new_data, replaced_count).  Versions without the literal are
+    left untouched, so this remains compatible with older Antigravity builds.
+    """
+    count = _count_sub(data, MANAGER_CLIENT_GATE_OLD)
+    if count:
+        data = data.replace(MANAGER_CLIENT_GATE_OLD, MANAGER_CLIENT_GATE_NEW)
+    return data, count
+
+
 def get_status(path):
     if not path or not os.path.isfile(path):
         return ("unknown", None)
@@ -192,9 +236,16 @@ def get_status(path):
         with _mapped(path) as d:
             try:
                 state, off, g = MANAGER_GATE.resolve(d)
-                return (state, g)
             except LookupError:
                 return ("unknown", None)
+            client_state = _client_gate_state(d)
+            if state == "patched" and client_state in ("patched", "not_applicable"):
+                final_state = "patched"
+            elif state == "unpatched" and client_state in ("unpatched", "not_applicable"):
+                final_state = "unpatched"
+            else:
+                final_state = "partial"
+            return (final_state, g)
     except OSError:
         return ("unknown", None)
 
@@ -203,10 +254,15 @@ def is_already_patched(path):
     return get_status(path)[0] == "patched"
 
 
-def _make_backup(path):
+def _make_backup(path, refresh_allowed=False):
     bak = path + BAK_EXT
     if os.path.exists(bak):
         if filecmp.cmp(path, bak, shallow=False):
+            return
+        if not refresh_allowed:
+            # Re-patching an already/partially patched binary must never
+            # overwrite the pristine backup with patched bytes.
+            warn(f"Backup already exists and differs from current binary; preserving {os.path.basename(bak)}")
             return
         info(f"Backup is stale (app updated) — refreshing {os.path.basename(path)}{BAK_EXT}")
     else:
@@ -271,6 +327,7 @@ def do_patch_manager(path):
 
     write_success = False
     off = 0
+    client_gate_replaced = 0
     for attempt in range(2):
         if is_locked(path):
             if attempt == 0:
@@ -292,16 +349,34 @@ def do_patch_manager(path):
                     err(f"{e}")
                     handle_patch_failure()
                     return
-                if kind == "patched":
-                    hint("Antigravity Manager already patched.")
+                client_state = _client_gate_state(d)
+                fully_patched = (
+                    kind == "patched"
+                    and client_state in ("patched", "not_applicable")
+                )
+                partially_patched = (
+                    not fully_patched
+                    and (kind == "patched" or client_state == "patched")
+                )
+                if fully_patched:
+                    hint("Antigravity Manager already patched (auth + client gate).")
                     if not confirm_with_captcha("Apply patch anyway?"):
                         return
+                elif partially_patched:
+                    hint("Partially patched — applying the missing gate.")
         except OSError as e:
             err(f"Read error: {e}")
             return
 
+        # Do not overwrite a pristine backup when re-patching a patched or
+        # partially patched binary.  A refresh is only safe when both gates
+        # are still unpatched (i.e. the app was updated).
+        refresh_backup = (
+            kind == "unpatched"
+            and client_state in ("unpatched", "not_applicable")
+        )
         try:
-            _make_backup(path)
+            _make_backup(path, refresh_allowed=refresh_backup)
         except (PermissionError, OSError) as e:
             err(f"Backup error: {e}")
             if sys.platform == "darwin":
@@ -322,6 +397,9 @@ def do_patch_manager(path):
 
                     # Валидация (offset, границы, размер) и применение патча
                     bdata = apply_patches_to_data(bdata, [(off, matched_gate)])
+                    bdata, client_gate_replaced = _apply_client_gate(bdata)
+                    if _count_sub(bdata, MANAGER_CLIENT_GATE_OLD):
+                        raise RuntimeError("client gate literal remains after patch")
 
                     f.seek(0)
                     f.write(bdata)
@@ -334,6 +412,9 @@ def do_patch_manager(path):
 
                 # Валидация (offset, границы, размер) и применение патча
                 bdata = apply_patches_to_data(bdata, [(off, matched_gate)])
+                bdata, client_gate_replaced = _apply_client_gate(bdata)
+                if _count_sub(bdata, MANAGER_CLIENT_GATE_OLD):
+                    raise RuntimeError("client gate literal remains after patch")
 
                 # Атомарная замена с безопасным временным файлом
                 # (на macOS каталог .app может нести uchg — снимаем перед mkstemp)
@@ -387,11 +468,21 @@ def do_patch_manager(path):
     resign_macos_binary(path)
     print()
     step("Patch manager binary", True, matched_gate.desc)
+    if client_gate_replaced:
+        step(
+            "Patch manager client gate",
+            True,
+            f"{MANAGER_CLIENT_GATE_DESC} (2.35.1, {client_gate_replaced} occurrences)",
+        )
     print()
     panel_rows = [
         ("Target", os.path.basename(path)),
         ("Gate", f"{matched_gate.desc} @ 0x{off:x}"),
     ]
+    if client_gate_replaced:
+        panel_rows.append(
+            ("Client gate", f"{MANAGER_CLIENT_GATE_DESC} ({client_gate_replaced})")
+        )
     if hash_before and hash_after:
         panel_rows.append(("Before", f"{hash_before[:8]}...{hash_before[56:]}"))
         panel_rows.append(("After", f"{hash_after[:8]}...{hash_after[56:]}"))
@@ -412,7 +503,7 @@ def do_restore_manager(path):
         return
 
     status, _ = get_status(path)
-    if status != "patched":
+    if status not in ("patched", "partial"):
         warn("Manager is not patched — skipping restore (backup may be a different build).")
         if not confirmed("Restore from backup anyway?"):
             hint("Restore cancelled.")
